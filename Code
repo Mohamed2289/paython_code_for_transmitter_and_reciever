@@ -1,0 +1,122 @@
+import pyaudio
+import numpy as np
+from scipy.signal import convolve, chirp
+
+# Set up the parameters
+CHUNK = 1024 # Number of samples per frame
+FORMAT = pyaudio.paFloat32 # Audio format
+CHANNELS = 1 # Mono audio
+RATE = 44100 # Sampling rate
+FREQUENCY = 1000 # Frequency of the transmitted signal
+CARRIER_FREQUENCY = 5000 # Frequency of the carrier signal
+MODULATION_INDEX = 0.5 # Modulation index for FM modulation
+SNR = 10 # Signal-to-noise ratio for adding noise to the transmitted signal
+FIR_FILTER_COEFFS = np.array([0.03782845550699572, 0.11348536652098717, 0.1735429661114995, 0.20134823153553138,
+                              0.1735429661114995, 0.11348536652098717, 0.03782845550699572]) # FIR filter coefficients
+CONVOLUTION_MODE = 'same' # Mode for convolution
+POLYNOMIAL = [1, 0, 1, 1] # Generator polynomial for CRC-4 error correction
+MESSAGE_LENGTH = 16 # Length of the message
+PREAMBLE_LENGTH = 8 # Length of the preamble
+CRC_LENGTH = 4 # Length of the CRC code
+
+# Initialize the PyAudio stream
+p = pyaudio.PyAudio()
+
+# Open the stream for the transmitter
+stream_tx = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    output=True)
+
+# Open the stream for the receiver
+stream_rx = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+
+# Generate the message bits
+message_bits = np.random.randint(2, size=MESSAGE_LENGTH)
+
+# Add the preamble bits
+preamble_bits = np.random.randint(2, size=PREAMBLE_LENGTH)
+tx_bits = np.concatenate((preamble_bits, message_bits))
+
+# Calculate the CRC code
+crc_code = np.zeros(CRC_LENGTH, dtype=np.int32)
+for i in range(MESSAGE_LENGTH):
+    for j in range(CRC_LENGTH):
+        if (tx_bits[i+j] == 1):
+            crc_code[j] ^= POLYNOMIAL[j]
+
+# Add the CRC code to the message bits
+tx_bits = np.concatenate((tx_bits, crc_code))
+
+# Modulate the bits using FM modulation
+t = np.linspace(0, CHUNK / RATE, CHUNK)
+modulated_signal = chirp(t, FREQUENCY, CHUNK / RATE, FREQUENCY + MODULATION_INDEX * tx_bits)
+
+# Add the carrier signal
+carrier_signal = np.sin(2 * np.pi * CARRIER_FREQUENCY * t)
+tx_signal = modulated_signal * carrier_signal
+
+# Add noise to the transmitted signal
+noise = np.random.normal(0, 1, CHUNK)
+tx_signal += np.sqrt(np.var(tx_signal) / (10**(SNR/10))) * noise
+
+# Filter the transmitted signal using an FIR filter
+tx_signal_filtered = convolve(tx_signal, FIR_FILTER_COEFFS, mode=CONVOLUTION_MODE)
+
+# Transmit the signal
+stream_tx.write(tx_signal_filtered.astype(np.float32).tobytes())
+
+# Receive the signal
+data = stream_rx.read(CHUNK, exception_on_overflow=False)
+received_signal = np.frombuffer(data, dtype=np.float32)
+
+# Demodulate the received signal using FM demodulation
+demodulated_signal = np.diff(np.unwrap(np.angle(received_signal * np.conj(carrier_signal)))) / (2 * np.pi * (1 / RATE) * MODULATION_INDEX)
+
+# Filter the demodulated signal using an FIR filter
+demodulated_signal_filtered = convolve(demodulated_signal, FIR_FILTER_COEFFS, mode=CONVOLUTION_MODE)
+
+# Detect the preamble and message bits
+preamble_detected = False
+rx_bits = np.zeros(MESSAGE_LENGTH + PREAMBLE_LENGTH + CRC_LENGTH, dtype=np.int32)
+for i in range(CHUNK):
+    if (not preamble_detected):
+        if (np.sum(np.abs(demodulated_signal_filtered[i:i+PREAMBLE_LENGTH] - preamble_bits)) == 0):
+            preamble_detected = True
+            rx_bits[:PREAMBLE_LENGTH] = preamble_bits
+            bit_index = PREAMBLE_LENGTH
+    else:
+        rx_bits[bit_index] = 1 if (demodulated_signal[i] > 0) else 0
+        bit_index += 1
+        if (bit_index == MESSAGE_LENGTH + PREAMBLE_LENGTH):
+            break
+
+# Verify the CRC code
+crc_code_received = rx_bits[-CRC_LENGTH:]
+rx_bits_no_crc = rx_bits[:-CRC_LENGTH]
+crc_code_calculated = np.zeros(CRC_LENGTH, dtype=np.int32)
+for i in range(MESSAGE_LENGTH):
+    for j in range(CRC_LENGTH):
+        if (rx_bits_no_crc[i+j] == 1):
+            crc_code_calculated[j] ^= POLYNOMIAL[j]
+if (np.sum(crc_code_calculated != crc_code_received) == 0):
+    print('CRC code verified')
+else:
+    print('CRC code incorrect')
+
+# Close the streams
+stream_tx.stop_stream()
+stream_tx.close()
+stream_rx.stop_stream()
+stream_rx.close()
+
+# Terminate PyAudio
+p.terminate()
+
+# Print the results
+print('Transmitted bits:', tx_bits)
+print('Received bits:', rx_bits)
